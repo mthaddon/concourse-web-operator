@@ -1,0 +1,29 @@
+# Copyright 2021 Canonical Ltd.
+# See LICENSE file for licensing details.
+name: concourse-web
+description: |
+  A Juju Charm deploying and operating the Concourse CI web node.
+summary: |
+  Concourse is an open-source continuous thing-doer.
+
+containers:
+  concourse-web:
+    resource: concourse-image
+
+resources:
+  concourse-image:
+    type: oci-image
+    description: OCI image for concourse (https://hub.docker.com/r/concourse/concourse)
+
+peers:
+  peer:
+    interface: peer
+
+requires:
+  concourse-worker:
+    interface: concourse-worker
+  db:
+    interface: pgsql
+    limit: 1
+  ingress:
+    interface: ingress

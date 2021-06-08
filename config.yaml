@@ -1,0 +1,12 @@
+# Copyright 2021 Canonical Ltd.
+# See LICENSE file for licensing details.
+#
+options:
+  external-url:
+    default: ""
+    description: The external hostname for this service. If unset, the application name will be used.
+    type: string
+  tls-secret-name:
+    default: ""
+    description: The TLS secret name in kubernetes to use. If unset, the service will only respond on http.
+    type: string
