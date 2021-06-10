@@ -59,6 +59,8 @@ class ConcourseWebOperatorCharm(CharmBase):
         # defined on the peer relation, and if not, and we're the leader, create
         # them.
 
+        # We're crea
+
         # First, check if they already exist on disk, if so, exit. We're
         # checking in the charm container and we'll "mirror" content from here
         # into the workload container.
@@ -72,11 +74,18 @@ class ConcourseWebOperatorCharm(CharmBase):
 
         # Now check if we have them already defined on the relation. If so,
         # generate them from that.
-        container = self.unit.get_container("concourse-web")
+        try:
+            container = self.unit.get_container("concourse-web")
+        except ConnectionError:
+            event.defer()
+            return
         keys_found = True
         for key, location in self._concourse_web_key_locations.items():
             key = event.relation.data[event.app].get(key)
             if key:
+                # We could just write locally, or we can use `container.push`
+                # since /concourse-keys is mounted in the charm and workload
+                # containers.
                 container.push(
                     location,
                     key,
@@ -106,36 +115,39 @@ class ConcourseWebOperatorCharm(CharmBase):
         #        /usr/local/concourse/bin/concourse generate-key -t rsa -f ./session_signing_key
         #        /usr/local/concourse/bin/concourse generate-key -t ssh -f ./tsa_host_key
         #        /usr/local/concourse/bin/concourse generate-key -t ssh -f ./worker_key
-        concourse_binary_path = self._get_concourse_binary_path(container)
-
-        # Create our directory to hold these keys.
-        os.mkdir(os.path.dirname(self._concourse_web_key_locations["CONCOURSE_SESSION_SIGNING_KEY"]))
+        try:
+            concourse_binary_path = self._get_concourse_binary_path(container)
+        except ConnectionError:
+            # This may happen even though we've been able to get the container
+            # if the file doesn't exist on disk yet.
+            # XXX: ^ that sounds a bit odd and needs further investigation.
+            event.defer()
+            return
 
         # CONCOURSE_SESSION_SIGNING_KEY.
         subprocess.run([concourse_binary_path, "generate-key", "-t", "rsa", "-f",
                         self._concourse_key_locations["CONCOURSE_SESSION_SIGNING_KEY"]])
-        with open(self._concourse_key_locations["CONCOURSE_SESSION_SIGNING_KEY"], "r") as session_signing_key:
+        # No need to push to the container, as we've mounted /concourse-keys at
+        # the same location. So just publish on the relation so peers can consume.
+        with open(self._concourse_key_locations["CONCOURSE_SESSION_SIGNING_KEY"], 'r') as session_signing_key:
             session_signing_key_data = session_signing_key.read()
-            container.push(
-                self._concourse_key_locations["CONCOURSE_SESSION_SIGNING_KEY"],
-                session_signing_key_data,
-                make_dirs=True,
-            )
-            event.relation.data[self.app]["CONCOURSE_SESSION_SIGNING_KEY"] = session_signing_key_data
-            logger.info("Set CONCOURSE_SESSION_SIGNING_KEY on the concourse-web peer relation.")
+        event.relation.data[self.app]["CONCOURSE_SESSION_SIGNING_KEY"] = session_signing_key_data
+        logger.info("Set CONCOURSE_SESSION_SIGNING_KEY on the concourse-web peer relation.")
 
-        # CONCOURSE_TSA_HOST_KEY.
+        # CONCOURSE_TSA_HOST_KEY and CONCOURSE_TSA_HOST_KEY_PUB.
+        # Not quite clear yet on whether we should use the same one for all web nodes yet...
         subprocess.run([concourse_binary_path, "generate-key", "-t", "ssh", "-f",
                         self._concourse_key_locations["CONCOURSE_TSA_HOST_KEY"]])
-        with open(self._concourse_key_locations["CONCOURSE_TSA_HOST_KEY"], "r") as tsa_host_key:
+        # No need to push to the container, as we've mounted /concourse-keys at
+        # the same location. So just publish on the relation so peers can consume.
+        with open(self._concourse_key_locations["CONCOURSE_TSA_HOST_KEY"], 'r') as tsa_host_key:
             tsa_host_key_data = tsa_host_key.read()
-            container.push(
-                self._concourse_key_locations["CONCOURSE_TSA_HOST_KEY"],
-                tsa_host_key_data,
-                make_dirs=True,
-            )
-            event.relation.data[self.app]["CONCOURSE_TSA_HOST_KEY"] = tsa_host_key_data
-            logger.info("Set CONCOURSE_TSA_HOST_KEY on the concourse-web peer relation.")
+        event.relation.data[self.app]["CONCOURSE_TSA_HOST_KEY"] = tsa_host_key_data
+        logger.info("Set CONCOURSE_TSA_HOST_KEY on the concourse-web peer relation.")
+        with open(self._concourse_key_locations["CONCOURSE_TSA_HOST_KEY_PUB"], 'r') as tsa_host_key_pub:
+            tsa_host_key_pub_data = tsa_host_key_pub.read()
+        event.relation.data[self.app]["CONCOURSE_TSA_HOST_KEY_PUB"] = tsa_host_key_pub_data
+        logger.info("Set CONCOURSE_TSA_HOST_KEY_PUB on the concourse-web peer relation.")
 
     def _get_concourse_binary_path(self, container):
         with NamedTemporaryFile(delete=False) as temp:
@@ -152,6 +164,8 @@ class ConcourseWebOperatorCharm(CharmBase):
         return {
             "CONCOURSE_SESSION_SIGNING_KEY": "/concourse-keys/session_signing_key",
             "CONCOURSE_TSA_HOST_KEY": "/concourse-keys/tsa_host_key",
+            # This one isn't used by the container, but we set it for convenience.
+            "CONCOURSE_TSA_HOST_KEY_PUB": "/concourse-keys/tsa_host_key.pub",
         }
 
     @property
@@ -166,11 +180,22 @@ class ConcourseWebOperatorCharm(CharmBase):
         key_locations.update(self._concourse_worker_key_locations)
         return key_locations
 
-    def _on_concourse_worker_relation_joined(self, _):
-        # We're not passing any information on this relation yet, we just want
-        # to know it's there so we can tell the user it's needed if it isn't.
-        # In the future we may want to pass keys...
+    def _on_concourse_worker_relation_joined(self, event):
         self._stored.concourse_worker = True
+        # Do we need to do this once per app, or once per unit?
+        if self.unit.is_leader():
+            try:
+                container = self.unit.get_container("concourse-web")
+            except ConnectionError:
+                event.defer()
+                return
+            tsa_host_key_pub = container.pull(self._concourse_web_key_locations["CONCOURSE_TSA_HOST_KEY_PUB"]).read()
+            # XXX: We'll need to react to leader elected here and update as appropriate.
+            leader_address = str(self.model.get_binding(event.relation).network.bind_address)
+            event.relation.data[self.app]["TSA_HOST"] = leader_address
+            logger.info("Set TSA_HOST to %s on the concourse_worker relation.", leader_address)
+            event.relation.data[self.app]["CONCOURSE_TSA_HOST_KEY_PUB"] = tsa_host_key_pub
+            logger.info("Set CONCOURSE_TSA_HOST_KEY_PUB on the concourse_worker relation.")
         # Trigger our config changed hook again.
         self.on.config_changed.emit()
 

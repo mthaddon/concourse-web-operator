@@ -9,6 +9,9 @@ summary: |
 containers:
   concourse-web:
     resource: concourse-image
+    mounts:
+      - storage: concourse-keys
+        location: /concourse-keys
 
 resources:
   concourse-image:
@@ -27,3 +30,8 @@ requires:
     limit: 1
   ingress:
     interface: ingress
+
+storage:
+  concourse-keys:
+    type: filesystem
+    location: /concourse-keys
