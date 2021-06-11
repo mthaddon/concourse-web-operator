@@ -33,6 +33,7 @@ class ConcourseWebOperatorCharm(CharmBase):
 
         self._stored.set_default(
             concourse_worker=False,
+            concourse_worker_pub_keys=[],
             db_name=None,
             db_host=None,
             db_port=None,
@@ -48,6 +49,7 @@ class ConcourseWebOperatorCharm(CharmBase):
         self.framework.observe(self.db.on.standby_changed, self._on_standby_changed)
 
         self.framework.observe(self.on.concourse_worker_relation_joined, self._on_concourse_worker_relation_joined)
+        self.framework.observe(self.on.concourse_worker_relation_changed, self._on_concourse_worker_relation_changed)
         self.framework.observe(self.on.concourse_worker_relation_broken, self._on_concourse_worker_relation_broken)
 
         self.framework.observe(self.on["peer"].relation_created, self._on_peer_relation_changed)
@@ -74,11 +76,7 @@ class ConcourseWebOperatorCharm(CharmBase):
 
         # Now check if we have them already defined on the relation. If so,
         # generate them from that.
-        try:
-            container = self.unit.get_container("concourse-web")
-        except ConnectionError:
-            event.defer()
-            return
+        container = self.unit.get_container("concourse-web")
         keys_found = True
         for key, location in self._concourse_web_key_locations.items():
             key = event.relation.data[event.app].get(key)
@@ -86,11 +84,15 @@ class ConcourseWebOperatorCharm(CharmBase):
                 # We could just write locally, or we can use `container.push`
                 # since /concourse-keys is mounted in the charm and workload
                 # containers.
-                container.push(
-                    location,
-                    key,
-                    make_dirs=True,
-                )
+                try:
+                    container.push(
+                        location,
+                        key,
+                        make_dirs=True,
+                    )
+                except ConnectionError:
+                    event.defer()
+                    return
             else:
                 keys_found = False
         if keys_found:
@@ -116,11 +118,8 @@ class ConcourseWebOperatorCharm(CharmBase):
         #        /usr/local/concourse/bin/concourse generate-key -t ssh -f ./tsa_host_key
         #        /usr/local/concourse/bin/concourse generate-key -t ssh -f ./worker_key
         try:
-            concourse_binary_path = self._get_concourse_binary_path(container)
+            concourse_binary_path = self._get_concourse_binary_path()
         except ConnectionError:
-            # This may happen even though we've been able to get the container
-            # if the file doesn't exist on disk yet.
-            # XXX: ^ that sounds a bit odd and needs further investigation.
             event.defer()
             return
 
@@ -149,7 +148,8 @@ class ConcourseWebOperatorCharm(CharmBase):
         event.relation.data[self.app]["CONCOURSE_TSA_HOST_KEY_PUB"] = tsa_host_key_pub_data
         logger.info("Set CONCOURSE_TSA_HOST_KEY_PUB on the concourse-web peer relation.")
 
-    def _get_concourse_binary_path(self, container):
+    def _get_concourse_binary_path(self):
+        container = self.unit.get_container("concourse-web")
         with NamedTemporaryFile(delete=False) as temp:
             temp.write(container.pull("/usr/local/concourse/bin/concourse", encoding=None).read())
             temp.flush()
@@ -184,12 +184,14 @@ class ConcourseWebOperatorCharm(CharmBase):
         self._stored.concourse_worker = True
         # Do we need to do this once per app, or once per unit?
         if self.unit.is_leader():
+            container = self.unit.get_container("concourse-web")
             try:
-                container = self.unit.get_container("concourse-web")
+                tsa_host_key_pub = container.pull(
+                    self._concourse_web_key_locations["CONCOURSE_TSA_HOST_KEY_PUB"]
+                ).read()
             except ConnectionError:
                 event.defer()
                 return
-            tsa_host_key_pub = container.pull(self._concourse_web_key_locations["CONCOURSE_TSA_HOST_KEY_PUB"]).read()
             # XXX: We'll need to react to leader elected here and update as appropriate.
             leader_address = str(self.model.get_binding(event.relation).network.bind_address)
             event.relation.data[self.app]["TSA_HOST"] = leader_address
@@ -198,6 +200,19 @@ class ConcourseWebOperatorCharm(CharmBase):
             logger.info("Set CONCOURSE_TSA_HOST_KEY_PUB on the concourse_worker relation.")
         # Trigger our config changed hook again.
         self.on.config_changed.emit()
+
+    def _on_concourse_worker_relation_changed(self, event):
+        changed = False
+        # XXX: We really want to iterate over all the units here.
+        if event.unit:
+            worker_key_pub = event.relation.data[event.unit].get("WORKER_KEY_PUB")
+            if worker_key_pub and worker_key_pub not in self._stored.concourse_worker_pub_keys:
+                changed = True
+                self._stored.concourse_worker_pub_keys.append(worker_key_pub)
+        if changed:
+            with open(self._concourse_key_locations["CONCOURSE_TSA_AUTHORIZED_KEYS"], "w") as authorized_keys:
+                authorized_keys.write("\n".join(self._stored.concourse_worker_pub_keys))
+                logger.info("Updated CONCOURSE_TSA_AUTHORIZED_KEYS file")
 
     def _on_concourse_worker_relation_broken(self, _):
         self._stored.concourse_worker = False
@@ -260,6 +275,13 @@ class ConcourseWebOperatorCharm(CharmBase):
                 "The following relations are required: {}".format(", ".join(required_relations))
             )
             return
+        # Check we have all the files we need. If we don't, it's likely because
+        # there are relation updates in progress.
+        for _, location in self._concourse_key_locations.items():
+            if not os.path.exists(location):
+                self.unit.status = BlockedStatus("Expected file doesn't exist yet: {}".format(location))
+                event.defer()
+                return
         container = self.unit.get_container("concourse-web")
         layer = self._concourse_layer()
         try:
@@ -278,6 +300,10 @@ class ConcourseWebOperatorCharm(CharmBase):
             container.start("concourse-web")
             logger.info("Restarted concourse-web service")
         self.unit.status = ActiveStatus()
+
+        # XXX: Todo: set workload version
+        # version = /usr/local/concourse/bin/concourse --version
+        # self.unit.set_workload_version(version)
 
     def _concourse_layer(self):
         return {
