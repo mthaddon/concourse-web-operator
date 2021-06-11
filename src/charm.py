@@ -321,12 +321,14 @@ class ConcourseWebOperatorCharm(CharmBase):
     @property
     def _env_config(self):
         env_config = {
-            "CONCOURSE_EXTERNAL_URL": self._external_url,
+            "CONCOURSE_EXTERNAL_URL": "http://{}".format(self._external_url),
             "CONCOURSE_POSTGRES_HOST": self._stored.db_host,
             "CONCOURSE_POSTGRES_PORT": self._stored.db_port,
             "CONCOURSE_POSTGRES_DATABASE": self._stored.db_name,
             "CONCOURSE_POSTGRES_USER": self._stored.db_user,
             "CONCOURSE_POSTGRES_PASSWORD": self._stored.db_password,
+            "CONCOURSE_ADD_LOCAL_USER": "myuser:mypass",
+            "CONCOURSE_MAIN_TEAM_LOCAL_USER": "myuser",
         }
         env_config.update(self._concourse_key_locations)
         return env_config
@@ -340,7 +342,7 @@ class ConcourseWebOperatorCharm(CharmBase):
         ingress_config = {
             "service-hostname": self._external_url,
             "service-name": self.app.name,
-            "service-port": 80,
+            "service-port": 8080,
             "tls-secret-name": self.config["tls-secret-name"],
         }
         return ingress_config
