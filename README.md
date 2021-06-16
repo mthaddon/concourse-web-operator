@@ -17,7 +17,6 @@ To deploy in a juju k8s model:
     # Add our relations
     juju relate concourse-web concourse-worker
     juju relate postgresql-k8s:db concourse-web
-    juju relate postgresql-k8s:db concourse-worker
     juju relate nginx-ingress-integrator concourse-web
 
 You can now visit `http://concourse-web` in a browser, assuming
