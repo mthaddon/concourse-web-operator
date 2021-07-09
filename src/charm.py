@@ -5,6 +5,9 @@
 import logging
 import os
 import subprocess
+from pathlib import Path
+
+import kubernetes
 
 from tempfile import NamedTemporaryFile
 
@@ -23,7 +26,26 @@ pgsql = ops.lib.use("pgsql", 1, "postgresql-charmers@lists.launchpad.net")
 logger = logging.getLogger(__name__)
 
 
+def _core_v1_api():
+    """Use the v1 k8s API."""
+    cl = kubernetes.client.ApiClient()
+    return kubernetes.client.CoreV1Api(cl)
+
+
+def _fix_lp_1892255():
+    """Workaround for lp:1892255."""
+    # Remove os.environ.update when lp:1892255 is FIX_RELEASED.
+    os.environ.update(
+        dict(
+            e.split("=")
+            for e in Path("/proc/1/environ").read_text().split("\x00")
+            if "KUBERNETES_SERVICE" in e
+        )
+    )
+
+
 class ConcourseWebOperatorCharm(CharmBase):
+    _authed = False
     _stored = StoredState()
 
     def __init__(self, *args):
@@ -180,6 +202,68 @@ class ConcourseWebOperatorCharm(CharmBase):
         key_locations.update(self._concourse_worker_key_locations)
         return key_locations
 
+    @property
+    def _k8s_service_name(self):
+        """Return a service name for the use creating a k8s service."""
+        return "{}-ssh-service".format(self.app.name)
+
+    def k8s_auth(self):
+        """Authenticate to kubernetes."""
+        if self._authed:
+            return
+
+        _fix_lp_1892255()
+
+        kubernetes.config.load_incluster_config()
+
+        self._authed = True
+
+    def _get_k8s_service(self):
+        """Get a K8s service definition."""
+        return kubernetes.client.V1Service(
+            api_version="v1",
+            kind="Service",
+            metadata=kubernetes.client.V1ObjectMeta(name=self._k8s_service_name),
+            spec=kubernetes.client.V1ServiceSpec(
+                selector={"app.kubernetes.io/name": self.app.name},
+                ports=[
+                    kubernetes.client.V1ServicePort(
+                        name="tcp-{}".format(2222),
+                        port=2222,
+                        target_port=2222,
+                    )
+                ],
+            ),
+        )
+
+    def _ensure_k8s_service(self):
+        """Create or update relevant k8s service."""
+        self.k8s_auth()
+        api = _core_v1_api()
+        body = self._get_k8s_service()
+        services = api.list_namespaced_service(namespace=self.model.name)
+        if self._k8s_service_name in [x.metadata.name for x in services.items]:
+            api.patch_namespaced_service(
+                name=self._k8s_service_name,
+                namespace=self.model.name,
+                body=body,
+            )
+            logger.info(
+                "Service updated in namespace %s with name %s",
+                self.model.name,
+                self._service_name,
+            )
+        else:
+            api.create_namespaced_service(
+                namespace=self.model.name,
+                body=body,
+            )
+            logger.info(
+                "Service created in namespace %s with name %s",
+                self.model.name,
+                self._service_name,
+            )
+
     def _on_concourse_worker_relation_joined(self, event):
         self._stored.concourse_worker = True
         # Do we need to do this once per app, or once per unit?
@@ -275,6 +359,22 @@ class ConcourseWebOperatorCharm(CharmBase):
                 "The following relations are required: {}".format(", ".join(required_relations))
             )
             return
+        try:
+            self._ensure_k8s_service()
+        except kubernetes.client.exceptions.ApiException as e:
+            if e.status == 403:
+                logger.error(
+                    "Insufficient permissions to create the k8s service, "
+                    "will request `juju trust` to be run"
+                )
+                self.unit.status = BlockedStatus(
+                    "Insufficient permissions, try: `juju trust {} --scope=cluster`".format(
+                        self.app.name
+                    )
+                )
+                return
+            else:
+                raise
         # Check we have all the files we need. If we don't, it's likely because
         # there are relation updates in progress.
         for _, location in self._concourse_key_locations.items():
