@@ -34,6 +34,7 @@ def _core_v1_api():
 
 class ConcourseWebOperatorCharm(CharmBase):
     _authed = False
+    _restart_required = False
     _stored = StoredState()
 
     def __init__(self, *args):
@@ -71,8 +72,6 @@ class ConcourseWebOperatorCharm(CharmBase):
         # defined on the peer relation, and if not, and we're the leader, create
         # them.
 
-        # We're crea
-
         # First, check if they already exist on disk, if so, exit. We're
         # checking in the charm container and we'll "mirror" content from here
         # into the workload container.
@@ -107,6 +106,9 @@ class ConcourseWebOperatorCharm(CharmBase):
                 keys_found = False
         if keys_found:
             logger.info("Found all concourse keys via the relation.")
+            # Trigger our config changed hook again.
+            self._restart_required = True
+            self.on.config_changed.emit()
             return
 
         # Assuming they're not available on the relation, we need to generate
@@ -157,6 +159,10 @@ class ConcourseWebOperatorCharm(CharmBase):
             tsa_host_key_pub_data = tsa_host_key_pub.read()
         event.relation.data[self.app]["CONCOURSE_TSA_HOST_KEY_PUB"] = tsa_host_key_pub_data
         logger.info("Set CONCOURSE_TSA_HOST_KEY_PUB on the concourse-web peer relation.")
+
+        # Trigger our config changed hook again.
+        self._restart_required = True
+        self.on.config_changed.emit()
 
     def _get_concourse_binary_path(self):
         container = self.unit.get_container("concourse-web")
@@ -283,6 +289,9 @@ class ConcourseWebOperatorCharm(CharmBase):
             with open(self._concourse_key_locations["CONCOURSE_TSA_AUTHORIZED_KEYS"], "w") as authorized_keys:
                 authorized_keys.write("\n".join(self._stored.concourse_worker_pub_keys))
                 logger.info("Updated CONCOURSE_TSA_AUTHORIZED_KEYS file")
+            # Trigger our config changed hook again.
+            self._restart_required = True
+            self.on.config_changed.emit()
 
     def _on_concourse_worker_relation_broken(self, _):
         self._stored.concourse_worker = False
@@ -378,12 +387,13 @@ class ConcourseWebOperatorCharm(CharmBase):
             return
         # Update our ingress definition if appropriate.
         self.ingress.update_config(self.ingress_config)
-        if services != layer["services"]:
+        if self._restart_required or services != layer["services"]:
             container.add_layer("concourse-web", layer, combine=True)
             logger.info("Added updated layer to concourse")
             if container.get_service("concourse-web").is_running():
                 container.stop("concourse-web")
             container.start("concourse-web")
+            self._restart_required = False
             logger.info("Restarted concourse-web service")
         self.unit.status = ActiveStatus()
 
