@@ -32,18 +32,6 @@ def _core_v1_api():
     return kubernetes.client.CoreV1Api(cl)
 
 
-def _fix_lp_1892255():
-    """Workaround for lp:1892255."""
-    # Remove os.environ.update when lp:1892255 is FIX_RELEASED.
-    os.environ.update(
-        dict(
-            e.split("=")
-            for e in Path("/proc/1/environ").read_text().split("\x00")
-            if "KUBERNETES_SERVICE" in e
-        )
-    )
-
-
 class ConcourseWebOperatorCharm(CharmBase):
     _authed = False
     _stored = StoredState()
@@ -212,8 +200,6 @@ class ConcourseWebOperatorCharm(CharmBase):
         if self._authed:
             return
 
-        _fix_lp_1892255()
-
         kubernetes.config.load_incluster_config()
 
         self._authed = True
@@ -251,7 +237,7 @@ class ConcourseWebOperatorCharm(CharmBase):
             logger.info(
                 "Service updated in namespace %s with name %s",
                 self.model.name,
-                self._service_name,
+                self._k8s_service_name,
             )
         else:
             api.create_namespaced_service(
@@ -261,7 +247,7 @@ class ConcourseWebOperatorCharm(CharmBase):
             logger.info(
                 "Service created in namespace %s with name %s",
                 self.model.name,
-                self._service_name,
+                self._k8s_service_name,
             )
 
     def _on_concourse_worker_relation_joined(self, event):
@@ -349,16 +335,6 @@ class ConcourseWebOperatorCharm(CharmBase):
         self._stored.db_ro_uris = [c.uri for c in event.standbys]
 
     def _on_config_changed(self, event):
-        required_relations = []
-        if not self._stored.db_conn_str:
-            required_relations.append("PostgreSQL")
-        if not self._stored.concourse_worker:
-            required_relations.append("Concourse Worker")
-        if required_relations:
-            self.unit.status = BlockedStatus(
-                "The following relations are required: {}".format(", ".join(required_relations))
-            )
-            return
         try:
             self._ensure_k8s_service()
         except kubernetes.client.exceptions.ApiException as e:
@@ -375,6 +351,16 @@ class ConcourseWebOperatorCharm(CharmBase):
                 return
             else:
                 raise
+        required_relations = []
+        if not self._stored.db_conn_str:
+            required_relations.append("PostgreSQL")
+        if not self._stored.concourse_worker:
+            required_relations.append("Concourse Worker")
+        if required_relations:
+            self.unit.status = BlockedStatus(
+                "The following relations are required: {}".format(", ".join(required_relations))
+            )
+            return
         # Check we have all the files we need. If we don't, it's likely because
         # there are relation updates in progress.
         for _, location in self._concourse_key_locations.items():
